@@ -8,7 +8,8 @@ def get_args():
     # Debug mode (used in get_transformer)
     parser.add_argument("--debug", action="store_true", help="Enable debug mode with reduced model layers")
     # Dataset parameters
-    parser.add_argument("--dataset_dir", type=str, required=True, help="Dataset directory")
+    parser.add_argument("--precache_dir", type=str, required=True, help="Dataset directory")
+    parser.add_argument("--video_dir_path", type=str, nargs='?', default=None, action=VideoDirAction, help="Original video directory (defaults to precache_dir)")
     parser.add_argument("--resolution", type=str, required=False, default="480x832", help="Resolution of the dataset")
     parser.add_argument(
         "--num_frames", type=int, required=False, default=81, help="Number of frames in videos in the dataset"
@@ -35,10 +36,10 @@ def get_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for initialization")
     parser.add_argument("--train_batch_size", type=int, default=1, help="Batch size for training")
     parser.add_argument("--dataloader_num_workers", type=int, default=1, help="Number of workers for data loading")
-    parser.add_argument("--max_steps", type=int, default=100000, help="Maximum number of training steps")
+    parser.add_argument("--max_steps", type=int, default=100000, help="Maximum number of optimizer steps")
     parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="Gradient clipping norm")
     parser.add_argument(
-        "--prompt_drop_prob", type=float, default=0.1, help="Probability of dropping prompts during training"
+        "--prompt_drop_prob", type=float, default=0.0, help="Probability of dropping prompts during training"
     )
 
     parser.add_argument("--gradient_checkpointing", type=str2bool, default=0, help="Use gradient checkpointing")
@@ -51,7 +52,37 @@ def get_args():
         help="Type of learning rate scheduler",
     )
     parser.add_argument("--num_warmup_steps", type=int, default=10, help="Number of warmup steps for lr scheduler")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=0, help="Number of updates steps to accumulate gradients for before performing a backward/update pass.")
+
+    parser.add_argument(
+        "--load_mask_latents",
+        action="store_true",
+        help="Whether to load mask latents for VACE context.",
+    )
+    parser.add_argument(
+        "--load_conditioned_video_latents",
+        action="store_true",
+        help="Whether to load conditioned video latents for VACE context.",
+    )
+    parser.add_argument(
+        "--load_ref_image_latents",
+        action="store_true",
+        help="Whether to load reference image latents for VACE context.",
+    )
+    parser.add_argument(
+        "--vace_component_dropout_prob",
+        type=float,
+        default=0.0,
+        help="Probability of dropping out VACE components during training.",
+    )
+    parser.add_argument("--train_lora", action="store_true", help="Train a lora instead of finetuning")
+    parser.add_argument("--lora_rank", type=int, default=0, help="Rank of lora. Must be set if using --train_lora")
+    parser.add_argument("--lora_alpha", type=int, default=0, help="Alpha of lora. Must be set if using --train_lora")
+    parser.add_argument("--network_dropout", type=float, default=0.0, help="Percent of neurons to remove from training per step. Only used when using --train_lora")
+    parser.add_argument("--low_vram", action="store_true", help="Config for constrained VRAM")
     args = parser.parse_args()
+    if args.video_dir_path is None:
+        args.video_dir_path = args.precache_dir
     return args
 
 
@@ -64,3 +95,10 @@ def str2bool(v):
         return False
     else:
         raise argparse.ArgumentTypeError("Boolean value expected.")
+
+class VideoDirAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        if values is None:
+            setattr(namespace, self.dest, namespace.precache_dir)
+        else:
+            setattr(namespace, self.dest, values)
