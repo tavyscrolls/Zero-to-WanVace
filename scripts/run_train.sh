@@ -1,15 +1,27 @@
+export PYTHONPATH=${PYTHONPATH}:${PWD}
 torchrun --standalone --nproc_per_node=1 training/train.py \
---dataset_dir ./datasets/3dgs-dissolve/videos \
---resolution 480x832 \
---num_frames 81 \
+--precache_dir ./precache \
+--video_dir_path ./datasets/test \
+--resolution 480x848 \
+--num_frames 9 \
 --vae_name wan \
 --max_sequence_length 512 \
---starting_checkpoint_dir "./weights/Wan2.1-T2V-1.3B/" \
---experiment_name run1_3dgs_dissolve \
+--starting_checkpoint_dir ./weights/wan \
+--experiment_name WanVACE \
 --learning_rate 1e-5 \
 --checkpoint_every 100 \
 --log_every 1 \
 --train_batch_size 1 \
 --gradient_checkpointing True \
+--gradient_accumulation_steps 2 \
 --num_warmup_steps 10 \
---output_dir ./outputs/run1_3dgs_dissolve/
+--output_dir ./outputs/WanVACE/ \
+--vace_component_dropout_prob 0.0 \
+--load_ref_image_latents \
+--load_conditioned_video_latents \
+--sharding_strategy "full" \
+--lr_scheduler_type "linear" \
+--train_lora \
+--lora_rank 32 \
+--lora_alpha 16 \
+--low_vram
