@@ -11,6 +11,12 @@ from .attention import flash_attention
 
 __all__ = ["WanModel"]
 
+try:
+    import xformers.ops as xops
+    _HAS_XFORMERS = True
+except ImportError:
+    _HAS_XFORMERS = False
+    print("Warning: xformers not found. Falling back to default attention.")
 
 def sinusoidal_embedding_1d(dim, position):
     # preprocess
@@ -134,13 +140,21 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
-            v=v,
-            k_lens=seq_lens,
-            window_size=self.window_size,
-        )
+        # Apply RoPE before attention
+        q_rope = rope_apply(q, grid_sizes, freqs)
+        k_rope = rope_apply(k, grid_sizes, freqs)
+
+        # --- Xformers Integration ---
+        if _HAS_XFORMERS and q_rope.is_cuda and k_rope.is_cuda and v.is_cuda:
+            x = xops.memory_efficient_attention(q_rope, k_rope, v, attn_bias=None)
+        else:
+            x = flash_attention(
+                q=q_rope,
+                k=k_rope,
+                v=v,
+                k_lens=seq_lens,
+                window_size=self.window_size,
+            )
 
         # output
         x = x.flatten(2)
@@ -163,8 +177,16 @@ class WanT2VCrossAttention(WanSelfAttention):
         k = self.norm_k(self.k(context)).view(b, -1, n, d)
         v = self.v(context).view(b, -1, n, d)
 
-        # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        # --- Xformers Integration for Cross-Attention ---
+        if _HAS_XFORMERS and q.is_cuda and k.is_cuda and v.is_cuda:
+            # Generate padding mask for context (key/value)
+            # xformers needs a mask for context where True means "padded out"
+            max_context_len = k.size(1)
+            context_padding_mask = torch.arange(max_context_len, device=k.device).unsqueeze(0) >= context_lens.unsqueeze(1)
+            attn_bias = xops.generate_padding_bias(context_padding_mask, dtype=q.dtype)
+            x = xops.memory_efficient_attention(q, k, v, attn_bias=attn_bias)
+        else:
+            x = flash_attention(q, k, v, k_lens=context_lens)
 
         # output
         x = x.flatten(2)
@@ -198,9 +220,24 @@ class WanI2VCrossAttention(WanSelfAttention):
         v = self.v(context).view(b, -1, n, d)
         k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
         v_img = self.v_img(context_img).view(b, -1, n, d)
-        img_x = flash_attention(q, k_img, v_img, k_lens=None)
-        # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+
+
+        # --- Xformers Integration for Image Cross-Attention ---
+        img_x = None
+        if _HAS_XFORMERS and q.is_cuda and k_img.is_cuda and v_img.is_cuda:
+            img_x = xops.memory_efficient_attention(q, k_img, v_img, attn_bias=None)
+        else:
+            img_x = flash_attention(q, k_img, v_img, k_lens=None) # k_lens=None as per original
+
+        # --- Xformers Integration for Text Cross-Attention ---
+        if _HAS_XFORMERS and q.is_cuda and k.is_cuda and v.is_cuda:
+            # Generate padding mask for text context
+            max_context_len = k.size(1)
+            text_padding_mask = torch.arange(max_context_len, device=k.device).unsqueeze(0) >= context_lens.unsqueeze(1)
+            attn_bias_text = xops.generate_padding_bias(text_padding_mask, dtype=q.dtype)
+            x = xops.memory_efficient_attention(q, k, v, attn_bias=attn_bias_text)
+        else:
+            x = flash_attention(q, k, v, k_lens=context_lens) # k_lens as per original
 
         # output
         x = x.flatten(2)
@@ -360,6 +397,7 @@ class WanModel(ModelMixin, ConfigMixin):
         qk_norm=True,
         cross_attn_norm=True,
         eps=1e-6,
+        use_gradient_checkpointing=False,
     ):
         r"""
         Initialize the diffusion model backbone.
@@ -416,6 +454,7 @@ class WanModel(ModelMixin, ConfigMixin):
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         # embeddings
         self.patch_embedding = nn.Conv3d(in_dim, dim, kernel_size=patch_size, stride=patch_size)
@@ -458,7 +497,6 @@ class WanModel(ModelMixin, ConfigMixin):
         seq_len,
         clip_fea=None,
         y=None,
-        use_gradient_checkpointing=False,
     ):
         r"""
         Forward pass through the diffusion model
@@ -527,7 +565,7 @@ class WanModel(ModelMixin, ConfigMixin):
             return custom_forward
 
         for block in self.blocks:
-            if self.training and use_gradient_checkpointing:
+            if self.training and self.use_gradient_checkpointing:
                 x = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
                     x,
@@ -591,3 +629,244 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # init output layer
         nn.init.zeros_(self.head.head.weight)
+
+class VaceWanAttentionBlock(WanAttentionBlock):
+    def __init__(
+            self,
+            cross_attn_type,
+            dim,
+            ffn_dim,
+            num_heads,
+            window_size=(-1, -1),
+            qk_norm=True,
+            cross_attn_norm=False,
+            eps=1e-6,
+            block_id=0
+    ):
+        super().__init__(cross_attn_type, dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps)
+        self.block_id = block_id
+        if block_id == 0:
+            self.before_proj = nn.Linear(self.dim, self.dim)
+            nn.init.zeros_(self.before_proj.weight)
+            nn.init.zeros_(self.before_proj.bias)
+        self.after_proj = nn.Linear(self.dim, self.dim)
+        nn.init.zeros_(self.after_proj.weight)
+        nn.init.zeros_(self.after_proj.bias)
+
+    def forward(self, c, x, **kwargs):
+        if self.block_id == 0:
+            c = self.before_proj(c) + x
+            all_c = []
+        else:
+            all_c = list(torch.unbind(c))
+            c = all_c.pop(-1)
+        c = super().forward(c, **kwargs)
+        c_skip = self.after_proj(c)
+        all_c += [c_skip, c]
+        c = torch.stack(all_c)
+        return c
+
+
+class BaseWanAttentionBlock(WanAttentionBlock):
+    def __init__(
+        self,
+        cross_attn_type,
+        dim,
+        ffn_dim,
+        num_heads,
+        window_size=(-1, -1),
+        qk_norm=True,
+        cross_attn_norm=False,
+        eps=1e-6,
+        block_id=None
+    ):
+        super().__init__(cross_attn_type, dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps)
+        self.block_id = block_id
+
+    def forward(self, x, hints, context_scale=1.0, **kwargs):
+        x = super().forward(x, **kwargs)
+        if self.block_id is not None:
+            x = x + hints[self.block_id] * context_scale
+        return x
+
+
+class VaceWanModel(WanModel):
+    @register_to_config
+    def __init__(self,
+                 vace_layers=None,
+                 vace_in_dim=None,
+                 model_type='t2v',
+                 patch_size=(1, 2, 2),
+                 text_len=512,
+                 in_dim=16,
+                 dim=2048,
+                 ffn_dim=8192,
+                 freq_dim=256,
+                 text_dim=4096,
+                 out_dim=16,
+                 num_heads=16,
+                 num_layers=32,
+                 window_size=(-1, -1),
+                 qk_norm=True,
+                 cross_attn_norm=True,
+                 eps=1e-6,
+                 use_gradient_checkpointing=False,
+                 ):
+        assert model_type == "t2v"
+        super().__init__(model_type, patch_size, text_len, in_dim, dim, ffn_dim, freq_dim, text_dim, out_dim,
+                         num_heads, num_layers, window_size, qk_norm, cross_attn_norm, eps, use_gradient_checkpointing)
+
+        self.vace_layers = [i for i in range(0, self.num_layers, 2)] if vace_layers is None else vace_layers
+        self.vace_in_dim = self.in_dim if vace_in_dim is None else vace_in_dim
+
+        assert 0 in self.vace_layers
+        self.vace_layers_mapping = {i: n for n, i in enumerate(self.vace_layers)}
+
+        # blocks
+        self.blocks = nn.ModuleList([
+            BaseWanAttentionBlock('t2v_cross_attn', self.dim, self.ffn_dim, self.num_heads, self.window_size, self.qk_norm,
+                                  self.cross_attn_norm, self.eps,
+                                  block_id=self.vace_layers_mapping[i] if i in self.vace_layers else None)
+            for i in range(self.num_layers)
+        ])
+
+        # vace blocks
+        self.vace_blocks = nn.ModuleList([
+            VaceWanAttentionBlock('t2v_cross_attn', self.dim, self.ffn_dim, self.num_heads, self.window_size, self.qk_norm,
+                                     self.cross_attn_norm, self.eps, block_id=i)
+            for i in self.vace_layers
+        ])
+
+        # vace patch embeddings
+        self.vace_patch_embedding = nn.Conv3d(
+            self.vace_in_dim, self.dim, kernel_size=self.patch_size, stride=self.patch_size
+        )
+
+    def forward_vace(
+        self,
+        x,
+        vace_context,
+        seq_len,
+        kwargs
+    ):
+        # embeddings
+        c = [self.vace_patch_embedding(u.unsqueeze(0)) for u in vace_context]
+        c = [u.flatten(2).transpose(1, 2) for u in c]
+        c = torch.cat([
+            torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
+                      dim=1) for u in c
+        ])
+
+        # arguments
+        new_kwargs = dict(x=x)
+        new_kwargs.update(kwargs)
+
+        for block in self.vace_blocks:
+            c = block(c, **new_kwargs)
+        hints = torch.unbind(c)[:-1]
+        return hints
+
+    def forward(
+        self,
+        x,
+        t,
+        vace_context,
+        context,
+        seq_len,
+        vace_context_scale=1.0,
+        clip_fea=None,
+        y=None,
+    ):
+        r"""
+        Forward pass through the diffusion model
+
+        Args:
+            x (List[Tensor]):
+                List of input video tensors, each with shape [C_in, F, H, W]
+            t (Tensor):
+                Diffusion timesteps tensor of shape [B]
+            context (List[Tensor]):
+                List of text embeddings each with shape [L, C]
+            seq_len (`int`):
+                Maximum sequence length for positional encoding
+            clip_fea (Tensor, *optional*):
+                CLIP image features for image-to-video mode
+            y (List[Tensor], *optional*):
+                Conditional video inputs for image-to-video mode, same shape as x
+
+        Returns:
+            List[Tensor]:
+                List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
+        """
+        device = self.patch_embedding.weight.device
+        if self.freqs.device != device:
+            self.freqs = self.freqs.to(device)
+
+        # embeddings
+        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+        grid_sizes = torch.stack(
+            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+        x = [u.flatten(2).transpose(1, 2) for u in x]
+        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+        assert seq_lens.max() <= seq_len
+        x = torch.cat([
+            torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
+                      dim=1) for u in x
+        ])
+
+        # time embeddings
+        with amp.autocast(dtype=torch.float32):
+            e = self.time_embedding(
+                sinusoidal_embedding_1d(self.freq_dim, t).float())
+            e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+
+        # context
+        context_lens = None
+        context = self.text_embedding(
+            torch.stack([
+                torch.cat(
+                    [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                for u in context
+            ]))
+
+        # arguments
+        kwargs = dict(
+            e=e0,
+            seq_lens=seq_lens,
+            grid_sizes=grid_sizes,
+            freqs=self.freqs,
+            context=context,
+            context_lens=context_lens)
+
+        hints = self.forward_vace(x, vace_context, seq_len, kwargs)
+        kwargs['hints'] = hints
+        kwargs['context_scale'] = vace_context_scale
+
+        def create_custom_forward(module):
+            def custom_forward(*inputs, **kwargs):
+                return module(*inputs, **kwargs)
+
+            return custom_forward
+
+        for block in self.blocks:
+            if self.training and self.use_gradient_checkpointing:
+                x = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block),
+                    x,
+                    **kwargs,
+                    use_reentrant=False,
+                )
+            else:
+                x = block(x, **kwargs)
+
+        # head
+        x = self.head(x, e)
+
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print(f"DEBUG: NaN/Inf detected in 'x' Shape: {x.shape}, Value: {x.min()}/{x.max()}")
+            raise ValueError("NaN/Inf detected in tensor after head.")
+
+        # unpatchify
+        x = self.unpatchify(x, grid_sizes)
+        return [u.float() for u in x]
