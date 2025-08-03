@@ -1,3 +1,6 @@
+TODO: Properly build vace_context from precache and validate - This is not working correctly!
+
+
 # Zero-to-Wan
 A minimalistic repo to finetune Wan2.1-1.3B
 
