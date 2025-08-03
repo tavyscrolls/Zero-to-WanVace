@@ -64,8 +64,9 @@ def encode_prompt(prompt, tokenizer, text_encoder, max_sequence_length=512, devi
 
 @click.command()
 @click.option("--video_dir", type=str, help="Path to the video directory")
+@click.option("--output_latent_dir", type=str, default=None, help="Directory to save cached latents. Defaults to video_dir if not specified.")
 @torch.no_grad()
-def main(video_dir):
+def main(video_dir, output_latent_dir):
     t0 = time.time()
     text_encoder, tokenizer = get_text_encoder()
     print(f"Time to load text encoder: {time.time() - t0:.2f} seconds")
@@ -76,7 +77,7 @@ def main(video_dir):
         with open(prompt_path, "r") as f:
             prompt = f.read()
         text_embed = encode_prompt(prompt=prompt, tokenizer=tokenizer, text_encoder=text_encoder)
-        torch.save(text_embed, Path(video_dir) / f"text_embed_{prompt_path.stem}.pt")
+        torch.save(text_embed, Path(output_latent_dir) / f"text_embed_{prompt_path.stem}.pt")
 
 
 if __name__ == "__main__":
