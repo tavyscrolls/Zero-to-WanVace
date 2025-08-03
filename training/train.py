@@ -1,3 +1,4 @@
+import math
 import functools
 import gc
 import json
@@ -5,12 +6,12 @@ import logging
 import os
 import time
 from datetime import datetime
-
+from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.optim as optim
 import wandb
-from safetensors.torch import save_file
+from safetensors.torch import save_file, load_file
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import (
     FullOptimStateDictConfig,
@@ -21,15 +22,30 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.distributed.fsdp.api import BackwardPrefetch
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper,
+    apply_activation_checkpointing,
+)
 from transformers import (
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
 )
-
-from models.wan.modules.model import WanAttentionBlock, WanModel
+from models.wan.modules.model import (
+    VaceWanAttentionBlock,
+    VaceWanModel,
+    WanAttentionBlock,
+    WanModel
+)
 from training.scheduler import FlowMatchScheduler
 from training.training_args import get_args
 from training.video_dataset import setup_data_modules
+from peft import LoraConfig, get_peft_model, TaskType
+from contextlib import nullcontext
+
+import torch.nn as nn
+import torch.cuda.amp as amp
+import bitsandbytes as bnb
 
 # Enable TF32 for faster training
 torch._inductor.config.coordinate_descent_tuning = True
@@ -39,6 +55,8 @@ torch._inductor.config.fx_graph_cache = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
+def my_checkpoint_policy(module):
+    return isinstance(module, (WanAttentionBlock, VaceWanAttentionBlock))
 
 def get_device_mesh():
     world_size = dist.get_world_size()
@@ -66,7 +84,7 @@ def get_device_mesh():
         return init_device_mesh("cuda", mesh_shape=(1, 1), mesh_dim_names=("dp_replicate", "dp_shard"))
 
 
-def apply_fsdp_v1(transformer, sharding_strategy, param_dtype, reduce_dtype):
+def apply_fsdp_v1(transformer, sharding_strategy, param_dtype, reduce_dtype, low_vram):
     def arg_to_shard(sharding_strategy):
         if sharding_strategy == "full":
             sharding_strategy = ShardingStrategy.FULL_SHARD
@@ -97,6 +115,7 @@ def apply_fsdp_v1(transformer, sharding_strategy, param_dtype, reduce_dtype):
         "sync_module_states": True,
         "limit_all_gathers": True,
         "use_orig_params": True,
+        "backward_prefetch": BackwardPrefetch.BACKWARD_POST if low_vram else BackwardPrefetch.BACKWARD_PRE,
     }
 
     transformer = FSDP(
@@ -116,46 +135,138 @@ def maybe_drop_prompt(prompt_drop_prob, encoder_hidden_states):
     ]
     return encoder_hidden_states
 
+def get_transformer(args):
+    model_config = {}
+    config_path = Path(args.starting_checkpoint_dir) / "config.json" if args.starting_checkpoint_dir else None
 
-def get_transformer(starting_checkpoint_dir: str):
-    model = WanModel.from_pretrained(starting_checkpoint_dir)
-    return model, model.config
+    if config_path and config_path.exists():
+        with open(config_path, "r") as f:
+            model_config = json.load(f)
+    else:
+        # Vace 1.3B testing
+        model_config = {
+            "_class_name": "VaceWanModel",
+            "dim": 1536,
+            "ffn_dim": 8960,
+            "num_heads": 12,
+            "num_layers": 80,
+            "in_dim": 16, # Latent channels for VAE
+            "out_dim": 16,
+            "patch_size": (1, 2, 2), # Temporal, Height, Width patch size
+            "text_len": 512,
+            "model_type": "t2v", # Vace is trained on t2v mode
+            # Vace specific parameters:
+            "vace_layers": [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28],
+            "vace_in_dim": 96 # The number of channels for vace_context
+        }
 
+    model_class_name = model_config.get("_class_name")
+    if model_class_name == "VaceWanModel":
+        ModelClass = VaceWanModel
+    elif model_class_name == "WanModel":
+        ModelClass = WanModel
+    else:
+        print("Unknown model type")
+        return None, None
+
+    init_params = model_config.copy()
+    # overwrite model_type='vace'
+    if model_class_name == "VaceWanModel":
+        init_params["model_type"] = "t2v"
+    init_params['use_gradient_checkpointing'] = args.gradient_checkpointing
+
+    # Ensure patch_size is a tuple
+    if 'patch_size' in init_params and isinstance(init_params['patch_size'], list):
+        init_params['patch_size'] = tuple(init_params['patch_size'])
+
+    model = ModelClass(**init_params)
+
+    if args.starting_checkpoint_dir and (Path(args.starting_checkpoint_dir) / "diffusion_pytorch_model.safetensors").exists():
+        checkpoint_path = Path(args.starting_checkpoint_dir) / "diffusion_pytorch_model.safetensors"
+        state_dict = load_file(checkpoint_path, device="cpu")
+        model.load_state_dict(state_dict, strict=False)
+        print(f"Loaded base weights from {checkpoint_path}")
+
+    if args.train_lora:
+        lora_target_modules=[
+            "q", "k", "v", "o", "ffn.0", "ffn.2", "before_proj", "after_proj"
+        ]
+        lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            target_modules=lora_target_modules,
+            lora_dropout=args.network_dropout,
+            bias="none",
+        )
+        model = get_peft_model(model, lora_config)
+
+    model.to(torch.bfloat16)
+    if args.low_vram and False:
+        model = apply_activation_checkpointing(
+            model,
+            checkpoint_wrapper_fn=checkpoint_wrapper,
+            check_fn=my_checkpoint_policy
+        )
+
+    return model, init_params
 
 def prepare_extra_input(latents=None):
     return {"seq_len": latents.shape[2] * latents.shape[3] * latents.shape[4] // 4}
 
 
 def forward(
-    transformer: WanModel,
+    transformer: VaceWanModel | WanModel,
     scheduler: FlowMatchScheduler,
     batch,
     device,
     prompt_drop_prob,
+    vace_context_drop_prob
 ):
-    latents_bcthw, encoder_hidden_states = batch
+    latents_bcthw, encoder_hidden_states, vace_context_latents = batch
     latents_bcthw = latents_bcthw.to(device)
-
     encoder_hidden_states = maybe_drop_prompt(
         prompt_drop_prob=prompt_drop_prob,
         encoder_hidden_states=encoder_hidden_states,
     )
-
+    vace_context_latents = vace_context_latents.to(device)
     noise = torch.randn_like(latents_bcthw)
     timestep_id = torch.randint(0, scheduler.num_train_timesteps, (1,))
     timestep = scheduler.timesteps[timestep_id].to(device)
     extra_input = prepare_extra_input(latents_bcthw)
     noisy_latents = scheduler.add_noise(original_samples=latents_bcthw, noise=noise, timestep=timestep)
     training_target = scheduler.training_target(sample=latents_bcthw, noise=noise, timestep=timestep)
+
+    try:
+        base_model = transformer.base_model.model
+    except AttributeError:
+        base_model = transformer
+
+    if True:
+        # This assumes first 32 channels are inactive/reactive frames and last 64 channels are masks
+        # Also assumes masks should be 1's (white)
+        # Use 0.0 dropout for vace_context unless you want to experiment with this.
+        if torch.rand(1) < vace_context_drop_prob:
+            vace_context_latents[:, :32, :, :, :] = 0.0
+            vace_context_latents[:, 32:96, :, :, :] = 1.0
+        transformer_kwargs = {
+            "x": noisy_latents,
+            "t": timestep,
+            "vace_context": vace_context_latents,
+            "context": [e[0] for e in encoder_hidden_states],
+            "seq_len": extra_input["seq_len"],
+            "clip_fea": None # Vace reference repo does not fully implement i2v
+        }
+    else:
+        transformer_kwargs = {
+            "x": noisy_latents,
+            "t": timestep,
+            "context": [e[0] for e in encoder_hidden_states],
+            "seq_len": extra_input["seq_len"],
+            "clip_fea": None # TODO: fix i2v training. Use source Zero-To-Wan repo for I2V models
+        }
     # Compute loss
     with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(device).type):
-        noise_pred = transformer(
-            x=noisy_latents,
-            t=timestep,
-            context=[e[0] for e in encoder_hidden_states],
-            seq_len=extra_input["seq_len"],
-            use_gradient_checkpointing=True,
-        )
+        noise_pred = transformer(**transformer_kwargs)
         noise_pred_stacked = torch.stack(noise_pred).float()
         loss = torch.nn.functional.mse_loss(noise_pred_stacked.float(), training_target.float())
         loss = loss * scheduler.training_weight(timestep)
@@ -223,7 +334,7 @@ def main():
     master_process = ddp_rank == 0
 
     # Initialize wandb for the master process
-    transformer, model_config = get_transformer(starting_checkpoint_dir=args.starting_checkpoint_dir)
+    transformer, model_config = get_transformer(args)
 
     param_count = sum(p.numel() for p in transformer.parameters())
 
@@ -251,18 +362,32 @@ def main():
     torch.cuda.set_device(device)
 
     sharding_strategy = args.sharding_strategy
+    # PyTorch documentation on FSDP's no_sync: https://pytorch.org/docs/stable/fsdp.html#gradient-synchronization
     transformer = apply_fsdp_v1(
-        transformer, sharding_strategy.replace("v1_", ""), param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+        transformer,
+        sharding_strategy.replace("v1_", ""),
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
+        low_vram=args.low_vram
     )
-
+    print("-----Inspecting VRAM after loading model-----")
+    print(torch.cuda.memory_summary(abbreviated=True))
+    print("---------------------------------------------")
     dist.barrier()
 
-    optimizer = optim.AdamW(
-        [param for param in transformer.parameters() if param.requires_grad],
-        lr=args.learning_rate,
-        betas=(0.95, 0.99),
-        fused=True,
-    )
+    if args.low_vram:
+        optimizer = bnb.optim.AdamW8bit(
+            [param for param in transformer.parameters() if param.requires_grad],
+            lr=args.learning_rate,
+            betas=(0.95, 0.99),
+        )
+    else:
+        optimizer = optim.AdamW(
+            [param for param in transformer.parameters() if param.requires_grad],
+            lr=args.learning_rate,
+            betas=(0.95, 0.99),
+            fused=True,
+        )
 
     num_warmup_steps = args.num_warmup_steps
 
@@ -276,14 +401,29 @@ def main():
         raise ValueError(f"Unknown lr scheduler type: {args.lr_scheduler_type}")
 
     train_dataset, train_dataloader = setup_data_modules(
-        dir_path=args.dataset_dir,
+        dir_path=args.precache_dir,
+        video_dir_path=args.video_dir_path,
         vae_name=args.vae_name,
         resolution=[int(x) for x in args.resolution.split("x")],
         max_sequence_length=args.max_sequence_length,
         num_frames=args.num_frames,
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
+        load_mask_latents=args.load_mask_latents,
+        load_ref_image_latents=args.load_ref_image_latents,
+        load_conditioned_video_latents=args.load_conditioned_video_latents,
+        vace_component_dropout_prob=args.vace_component_dropout_prob,
     )
+
+    effective_batch_size_per_optimizer_step = args.train_batch_size * args.gradient_accumulation_steps * dist.get_world_size()
+    steps_per_full_epoch = 0
+    total_epochs_to_display = 0
+
+    # Calculate how many effective optimizer steps make up one full pass over the dataset
+    steps_per_full_epoch = math.ceil(len(train_dataset) / effective_batch_size_per_optimizer_step)
+    if steps_per_full_epoch > 0:
+        total_epochs_to_display = math.ceil(args.max_steps / steps_per_full_epoch)
+
     # Setup logging
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
@@ -296,6 +436,8 @@ def main():
 
     # Initialize step counter
     global_step = 0
+    micro_step_counter = 0 # For gradient accumulation steps
+    loss_list = []
 
     # Training loop
     transformer.train()
@@ -309,88 +451,102 @@ def main():
 
     scheduler = FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)
     scheduler.set_timesteps(1000, training=True)
-    for epoch in range(500000):
-        if global_step >= args.max_steps:
-            break
+    epoch = 0
+    while True:
+        if hasattr(train_dataloader.sampler, 'set_epoch'):
+            train_dataloader.sampler.set_epoch(epoch)
 
         for batch_idx, batch in enumerate(train_dataloader):
             step_start_time = time.time()
             if global_step >= args.max_steps:
                 break
 
-            forward_start = time.time()
-            diffusion_loss = forward(
-                transformer=transformer,
-                scheduler=scheduler,
-                batch=batch,
-                device=device,
-                prompt_drop_prob=args.prompt_drop_prob,
-            )
-            forward_time = time.time() - forward_start
-            # Optimization step
-            backward_start = time.time()
-            optimizer.zero_grad()
-            diffusion_loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                transformer.parameters(), max_norm=args.grad_clip_norm, foreach=True
-            )
-            grad_norm = grad_norm.item()
-            optimizer.step()
-            lr_scheduler.step()
-            backward_time = time.time() - backward_start
-            step_end_time = time.time()
-            step_time = step_end_time - step_start_time
+            is_last_micro_batch = (micro_step_counter + 1) % args.gradient_accumulation_steps == 0
 
-            # Logging
-            if global_step % args.log_every == 0:
-                measured_time_for_log_steps = time.time() - start_time_for_log_steps
-                measured_time_for_log_steps = measured_time_for_log_steps / args.log_every
+            with transformer.no_sync() if not is_last_micro_batch else nullcontext():
+                forward_start = time.time()
+                diffusion_loss = forward(
+                    transformer=transformer,
+                    scheduler=scheduler,
+                    batch=batch,
+                    device=device,
+                    prompt_drop_prob=args.prompt_drop_prob,
+                    vace_context_drop_prob=args.vace_component_dropout_prob
+                )
+                forward_time = time.time() - forward_start
+                # Scale the loss and do the backward pass
+                loss = diffusion_loss / args.gradient_accumulation_steps
+                backward_start = time.time()
+                loss.backward()
+                backward_time = time.time() - backward_start
 
-                diffusion_loss_avg = avg_scalar_across_ranks(diffusion_loss.item())
+            loss_list.append(diffusion_loss.detach().item())
+            micro_step_counter += 1
 
-                if master_process:
-                    # Calculate average losses per timestep bin
-                    avg_fwdbwd_steps = measured_time_for_log_steps
-                    print(f"Avg fwdbwd steps: {avg_fwdbwd_steps} sec")
-                    # Log metrics to wandb
-                    if wandb_enabled:
-                        wandb.log(
-                            {
-                                "train/loss": diffusion_loss_avg,
-                                "train/learning_rate": lr_scheduler.get_last_lr()[0],
-                                "train/epoch": epoch,
-                                "train/step": global_step,
-                                "train/grad_norm": grad_norm,
-                                "timings/step_time": step_time,
-                                "timings/backward_time": backward_time,
-                                "timings/forward_time": forward_time,
-                            },
-                            step=global_step,
+            # Only update optimizer after accumulation
+            if is_last_micro_batch:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    transformer.parameters(), max_norm=args.grad_clip_norm, foreach=True
+                )
+                grad_norm = grad_norm.item()
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+                step_end_time = time.time()
+                step_time = step_end_time - step_start_time
+                global_step += 1
+
+                # Logging
+                if global_step % args.log_every == 0:
+                    measured_time_for_log_steps = time.time() - start_time_for_log_steps
+                    measured_time_for_log_steps = measured_time_for_log_steps / args.log_every
+
+                    avg_diffusion_loss = sum(loss_list) / len(loss_list)
+                    loss_list = []
+                    diffusion_loss_avg = avg_scalar_across_ranks(diffusion_loss.item())
+
+                    if master_process:
+                        # Calculate average losses per timestep bin
+                        avg_fwdbwd_steps = measured_time_for_log_steps
+                        print(f"Avg fwdbwd steps: {avg_fwdbwd_steps} sec")
+                        # Log metrics to wandb
+                        if wandb_enabled:
+                            wandb.log(
+                                {
+                                    "train/loss": diffusion_loss_avg,
+                                    "train/learning_rate": lr_scheduler.get_last_lr()[0],
+                                    "train/epoch": epoch,
+                                    "train/step": global_step,
+                                    "train/grad_norm": grad_norm,
+                                    "timings/step_time": step_time,
+                                    "timings/backward_time": backward_time,
+                                    "timings/forward_time": forward_time,
+                                },
+                                step=global_step,
+                            )
+
+                        logger.info(
+                            f"Epoch [{epoch}/{total_epochs_to_display}] "
+                            f"Step [{global_step}/{args.max_steps}] "
+                            f"Loss: {diffusion_loss:.4f} "
+                            f"Grad Norm: {grad_norm:.6f} "
+                            f"Avg fwdbwd steps: {avg_fwdbwd_steps} s "
+                            f"LR: {lr_scheduler.get_last_lr()[0]}"
                         )
 
-                    logger.info(
-                        f"Epoch [{epoch}/{500000}] "
-                        f"Step [{global_step}/{args.max_steps}] "
-                        f"Loss: {diffusion_loss:.4f} "
-                        f"Grad Norm: {grad_norm:.6f} "
-                        f"Avg fwdbwd steps: {avg_fwdbwd_steps} s "
-                        f"LR: {lr_scheduler.get_last_lr()[0]}"
+                    start_time_for_log_steps = time.time()
+
+                if global_step % args.checkpoint_every == 0 and global_step > 0:
+                    save_checkpoint(
+                        transformer=transformer, optimizer=optimizer, global_step=global_step, args=args, rank=ddp_rank
                     )
 
-                start_time_for_log_steps = time.time()
-
-            if global_step % args.checkpoint_every == 0 and global_step > 0:
-                save_checkpoint(
-                    transformer=transformer, optimizer=optimizer, global_step=global_step, args=args, rank=ddp_rank
-                )
-
-            global_step += 1
+        epoch += 1
 
     # Cleanup
     if master_process and wandb_enabled:
         wandb.finish()
     cleanup()
-
 
 if __name__ == "__main__":
     main()
